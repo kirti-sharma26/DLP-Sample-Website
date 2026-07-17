@@ -379,8 +379,67 @@
     pointer-events:none;
   }
 
+  .btn-primary:disabled{
+    opacity:0.6;
+    cursor:not-allowed;
+  }
+
   .btn-spacer{
     width:1px;
+  }
+
+  /* ============================================================
+     SUBMISSION STATUS (Saving.../Error) — used while talking to
+     the Apps Script backend
+     ============================================================ */
+  .submission-status{
+    display:none;
+    margin-top:14px;
+    padding:12px 16px;
+    border-radius:var(--radius-sm);
+    font-size:0.88rem;
+    font-weight:600;
+    line-height:1.4;
+  }
+
+  .submission-status.is-visible{
+    display:block;
+  }
+
+  .submission-status.status-saving{
+    background:#EAF3FC;
+    color:var(--color-primary);
+    border:1.5px solid var(--color-accent);
+  }
+
+  .submission-status.status-error{
+    background:var(--color-error-bg);
+    color:var(--color-error);
+    border:1.5px solid var(--color-error);
+  }
+
+  .confirmation-submission-id{
+    display:inline-block;
+    margin-top:16px;
+    padding:8px 16px;
+    background:var(--color-bg);
+    border:1.5px solid var(--color-border);
+    border-radius:var(--radius-sm);
+    font-size:0.85rem;
+    color:var(--color-text);
+    font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+    word-break:break-all;
+  }
+
+  .confirmation-submission-id .id-label{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--color-muted);
+    font-weight:600;
+    margin-right:6px;
+  }
+
+  #btnStartNew{
+    margin-top:26px;
   }
 
   /* ============================================================
@@ -641,6 +700,9 @@
           <button type="button" class="btn btn-primary" id="btnNext">Next</button>
         </div>
 
+        <!-- Saving / error status shown only while talking to the backend -->
+        <p class="submission-status" id="submissionStatus" aria-live="polite"></p>
+
       </form>
 
       <!-- ============================================================
@@ -649,11 +711,13 @@
       <div class="confirmation-screen" id="confirmationScreen">
         <div class="confirmation-icon">&#10003;</div>
         <h2 class="confirmation-title">Thank you</h2>
-        <p class="confirmation-message">
-          Application completed for demonstration purposes.<br>
-          This is a frontend prototype. Your responses have not been stored.
+        <p class="confirmation-message" id="confirmationMessage">
+          Application submitted successfully.<br>
+          Your response has been recorded.
         </p>
-        <p class="confirmation-note">You may close this window or refresh the page to start a new demo application.</p>
+        <p class="confirmation-submission-id" id="confirmationSubmissionId"></p>
+        <br>
+        <button type="button" class="btn btn-primary" id="btnStartNew">Start a New Application</button>
       </div>
 
     </div>
@@ -665,13 +729,19 @@
 
 <script>
 /* ================================================================
-   JAVASCRIPT: STATE, NAVIGATION, VALIDATION, CONFIRMATION
-   No backend calls are made anywhere in this script. All entered
-   data lives only in the browser's memory for the current session
-   and is discarded when the page is closed or refreshed.
+   JAVASCRIPT: STATE, NAVIGATION, VALIDATION, BACKEND SUBMISSION,
+   CONFIRMATION AND RESET
    ================================================================ */
 (function(){
   "use strict";
+
+  // ------------------------------------------------------------
+  // BACKEND URL
+  // This is the only backend endpoint used by this frontend. It is
+  // the deployed Google Apps Script Web App /exec URL. No spreadsheet
+  // ID, API key or private credential is ever included here.
+  // ------------------------------------------------------------
+  var SHEET_URL = "https://script.google.com/macros/s/AKfycbxTwzY2swtPrUsrW-xyrtUAFJfkaiPGhoG3z_okazK-Jf2jUWwb5a-Q57awk7f1S9dljw/exec";
 
   var TOTAL_SECTIONS = 3;
   var currentSection = 1;
@@ -682,8 +752,19 @@
   var btnNext = document.getElementById('btnNext');
   var formNav = document.getElementById('formNav');
   var confirmationScreen = document.getElementById('confirmationScreen');
+  var confirmationSubmissionId = document.getElementById('confirmationSubmissionId');
+  var btnStartNew = document.getElementById('btnStartNew');
   var progressWrap = document.getElementById('progressWrap');
   var formCard = document.querySelector('.form-card');
+  var submissionStatus = document.getElementById('submissionStatus');
+
+  // Submission state
+  var currentSubmissionId = null; // reused across retries of the same attempt
+  var isSubmitting = false;
+  var pollTimer = null;
+  var pollAttempts = 0;
+  var POLL_INTERVAL_MS = 1000;
+  var POLL_MAX_ATTEMPTS = 20; // ~20 seconds of polling
 
   /* ------------------------------------------------------------
      NAVIGATION: render which section is visible + update progress
@@ -826,6 +907,7 @@
      moving between sections automatically preserves answers.)
      ------------------------------------------------------------ */
   btnBack.addEventListener('click', function(){
+    if(isSubmitting){ return; }
     if(currentSection > 1){
       currentSection -= 1;
       renderSection();
@@ -833,6 +915,8 @@
   });
 
   btnNext.addEventListener('click', function(){
+    if(isSubmitting){ return; }
+
     var sectionValid = validateSection(currentSection);
     if(!sectionValid){
       // Focus the first invalid field for accessibility
@@ -845,22 +929,242 @@
       currentSection += 1;
       renderSection();
     } else {
-      submitForm();
+      submitToBackend();
     }
   });
 
+  /* ================================================================
+     FORM DATA COLLECTION
+     Gathers values from all three sections and maps them onto the
+     exact payload keys the Apps Script backend expects.
+     ================================================================ */
+  function collectPayload(){
+    var checkedDashboards = document.querySelector('input[name="uses-dashboards"]:checked');
+    var checkedFrequency = document.querySelector('input[name="data-frequency"]:checked');
+
+    return {
+      client_submission_id: currentSubmissionId,
+      orgName: document.getElementById('org-name').value.trim(),
+      orgWebsite: document.getElementById('org-website').value.trim(),
+      orgSector: document.getElementById('org-sector').value,
+      usesDashboards: checkedDashboards ? checkedDashboards.value : '',
+      dataFrequency: checkedFrequency ? checkedFrequency.value : '',
+      biggestChallenge: document.getElementById('data-challenge').value.trim(),
+      learningPriorities: document.getElementById('learning-priorities').value.trim(),
+      applicantName: document.getElementById('applicant-name').value.trim(),
+      applicantEmail: document.getElementById('applicant-email').value.trim(),
+      applicantRole: document.getElementById('applicant-role').value.trim(),
+      applicantTeam: document.getElementById('applicant-team').value
+    };
+  }
+
+  /* ================================================================
+     SUBMISSION ID GENERATION
+     A unique ID generated client-side so the backend can recognise
+     retries of the same attempt and avoid duplicate rows.
+     ================================================================ */
+  function generateSubmissionId(){
+    return 'dlp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+  }
+
+  /* ================================================================
+     POST REQUEST TO THE APPS SCRIPT BACKEND
+     Sent with mode: "no-cors" because the Apps Script Web App does
+     not return CORS headers to a GitHub Pages origin. The response
+     body is therefore not readable here - saving is confirmed
+     separately via the JSONP verification step below.
+     ================================================================ */
+  function sendSubmission(payload){
+    try {
+      fetch(SHEET_URL, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      }).catch(function(){
+        /* A network-level failure here still lets polling run its
+           course and time out gracefully into the error state. */
+      });
+    } catch (err) {
+      /* Synchronous failures (e.g. fetch unsupported) also fall
+         through to the polling timeout / error state. */
+    }
+  }
+
+  /* ================================================================
+     JSONP VERIFICATION
+     Confirms the submission was actually saved by calling
+     action=checkSubmission via a <script> tag, since the POST
+     response body cannot be read under mode:"no-cors".
+     ================================================================ */
+  var jsonpCounter = 0;
+
+  function checkSubmissionJSONP(submissionId, onResult){
+    jsonpCounter += 1;
+    var callbackName = 'dlpCallback_' + Date.now() + '_' + jsonpCounter;
+    var script = document.createElement('script');
+
+    var cleanup = function(){
+      delete window[callbackName];
+      if(script.parentNode){ script.parentNode.removeChild(script); }
+    };
+
+    window[callbackName] = function(result){
+      cleanup();
+      onResult(null, result);
+    };
+
+    script.onerror = function(){
+      cleanup();
+      onResult(new Error('JSONP verification request failed.'));
+    };
+
+    var url = SHEET_URL
+      + '?action=checkSubmission'
+      + '&submission_id=' + encodeURIComponent(submissionId)
+      + '&callback=' + encodeURIComponent(callbackName);
+
+    script.src = url;
+    document.body.appendChild(script);
+  }
+
+  function startPolling(submissionId){
+    pollAttempts = 0;
+    clearTimeout(pollTimer);
+    pollOnce(submissionId);
+  }
+
+  function pollOnce(submissionId){
+    pollAttempts += 1;
+
+    checkSubmissionJSONP(submissionId, function(err, result){
+      // Stop immediately if the user has since reset the form
+      if(submissionId !== currentSubmissionId){ return; }
+
+      if(!err && result && result.saved === true && result.submission_id === submissionId){
+        handleSubmissionSuccess(submissionId);
+        return;
+      }
+
+      if(pollAttempts >= POLL_MAX_ATTEMPTS){
+        handleSubmissionFailure();
+        return;
+      }
+
+      pollTimer = setTimeout(function(){ pollOnce(submissionId); }, POLL_INTERVAL_MS);
+    });
+  }
+
+  /* ================================================================
+     SUBMIT ORCHESTRATION
+     ================================================================ */
+  function submitToBackend(){
+    if(isSubmitting){ return; }
+    isSubmitting = true;
+
+    // Reuse the same submission ID across retries of this attempt so
+    // the backend's duplicate check prevents a second row being added.
+    if(!currentSubmissionId){
+      currentSubmissionId = generateSubmissionId();
+    }
+
+    setSavingState();
+    var payload = collectPayload();
+    sendSubmission(payload);
+    startPolling(currentSubmissionId);
+  }
+
   /* ------------------------------------------------------------
-     CONFIRMATION SCREEN
-     No data is sent or stored anywhere - the form is simply
-     hidden and a static confirmation message is shown.
+     SAVING STATE UI
      ------------------------------------------------------------ */
-  function submitForm(){
+  function setSavingState(){
+    btnNext.disabled = true;
+    btnNext.textContent = 'Saving\u2026';
+    btnBack.disabled = true;
+
+    submissionStatus.textContent = 'Saving your application \u2014 please wait, this can take a few seconds.';
+    submissionStatus.classList.remove('status-error');
+    submissionStatus.classList.add('is-visible', 'status-saving');
+  }
+
+  function clearStatusMessage(){
+    submissionStatus.textContent = '';
+    submissionStatus.classList.remove('is-visible', 'status-saving', 'status-error');
+  }
+
+  /* ------------------------------------------------------------
+     ERROR HANDLING
+     Keeps the form and entered answers intact, re-enables Submit,
+     and lets the user retry with the same submission ID.
+     ------------------------------------------------------------ */
+  function showError(message){
+    btnNext.disabled = false;
+    btnNext.textContent = 'Submit';
+    btnBack.disabled = (currentSection === 1);
+
+    submissionStatus.textContent = message;
+    submissionStatus.classList.remove('status-saving');
+    submissionStatus.classList.add('is-visible', 'status-error');
+  }
+
+  function handleSubmissionFailure(){
+    isSubmitting = false;
+    clearTimeout(pollTimer);
+    showError('We could not save your application. Please check your connection and try again.');
+  }
+
+  /* ------------------------------------------------------------
+     SUCCESS HANDLING
+     ------------------------------------------------------------ */
+  function handleSubmissionSuccess(submissionId){
+    isSubmitting = false;
+    clearTimeout(pollTimer);
+    clearStatusMessage();
+    showConfirmation(submissionId);
+  }
+
+  function showConfirmation(submissionId){
     formEl.style.display = 'none';
     formNav.style.display = 'none';
     progressWrap.style.display = 'none';
+
+    confirmationSubmissionId.innerHTML = '<span class="id-label">Submission ID:</span>' + submissionId;
     confirmationScreen.classList.add('is-visible');
     confirmationScreen.scrollIntoView({behavior:'smooth', block:'start'});
   }
+
+  /* ================================================================
+     FORM RESET — "Start a New Application"
+     ================================================================ */
+  btnStartNew.addEventListener('click', function(){
+    formEl.reset();
+
+    document.querySelectorAll('.radio-option.is-checked').forEach(function(el){
+      el.classList.remove('is-checked');
+    });
+    document.querySelectorAll('.field.has-error').forEach(function(el){
+      el.classList.remove('has-error');
+    });
+
+    currentSubmissionId = null;
+    isSubmitting = false;
+    pollAttempts = 0;
+    clearTimeout(pollTimer);
+    clearStatusMessage();
+
+    btnNext.disabled = false;
+    btnBack.disabled = true;
+
+    currentSection = 1;
+
+    confirmationScreen.classList.remove('is-visible');
+    formEl.style.display = '';
+    formNav.style.display = '';
+    progressWrap.style.display = '';
+
+    renderSection();
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  });
 
   // Initial render
   renderSection();
